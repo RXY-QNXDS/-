@@ -1,0 +1,147 @@
+#!/bin/bash
+# Description: This is a one-click script to compile the installation LAMP (PHP in FastCGI working mode)
+
+# Environment: centos7.5, apr-1.6.3.tar.gz, apr-util-1.6.1.tar.gz, httpd-2.4.34.tar.bz2, php-7.1.18.tar.bz2, mariadb-10.2.16-linux-x86_64.tar.gz, wordpress-4.9.4-zh_CN
+.tar.gz 
+
+# Download the above packages and place them in the /app/ 
+
+# Ensure that yum warehouses are set up, including local CDS and epel
+
+# All the services after compilation and installation are placed in /app/lamp/
+echo -e '\033[1;5;31mBEGIN \033[0m'
+mkdir -p /app/lamp
+
+# Install the required development kit groups
+echo -e '\033[1;31mInstall the group tools \033[0m'
+yum groupinstall -y 'development tools'
+echo -e '\033[1;31mFinish Installing the group tools \033[0m'
+
+# Create the function to compile and install HTTPD
+
+httpd () {
+# Unzip and move folders
+        cd /app
+        tar xf apr-1.6.3.tar.gz
+        tar xf apr-util-1.6.1.tar.gz
+        tar xf httpd-2.4.34.tar.bz2
+        mv apr-1.6.3 httpd-2.4.34/srclib/apr
+	mv apr-util-1.6.1 httpd-2.4.34/srclib/apr-util
+# Create the user and install the packages required for compilation
+        useradd -r -s /sbin/nologin apache
+        yum install -y pcre-devel openssl-devel expat-devel
+# Start compiling and installing
+        cd httpd-2.4.34/
+        ./configure --prefix=/app/lamp/httpd24 --enable-so --enable-ssl --enable-cgi --enable-rewrite --with-zlib --with-pcre --enable-modules=most --enable-mpms-share
+d=all --with-mpm=prefork --with-included-apr
+        make && make install
+# Modify configuration file
+        cd /app/lamp/httpd24/conf
+        sed -i '/^User/s/daemon/apache/' httpd.conf
+        sed -i '/^Group/s/daemon/apache/' httpd.conf
+        sed -i 's@^#\(Load.*proxy.so\)$@\1@' httpd.conf
+        sed -i 's@^#\(Load.*fcgi.so\)$@\1@' httpd.conf
+        sed -i 's@\(^[ ]\+D.* \)@\1index.php @' httpd.conf
+        echo "Include conf/extra/httpd-php.conf" >> httpd.conf
+        cd extra/
+        cat > httpd-php.conf <<-EOF
+        AddType application/x-httpd-php .php
+        AddType application/x-httpd-php-source .phps
+        ProxyRequests Off
+        ProxyPassMatch ^/(.*\.php)$ fcgi://127.0.0.1:9000/app/lamp/httpd24/htdocs/$1
+        EOF
+        cd
+}
+
+# Create the function to install mysql with binary package
+
+mariadb () {
+
+# Create the user
+        useradd -r -s /sbin/nologin mysql
+# Unzip the file and create a soft connection and modify permissions
+        cd /app
+        tar xf mariadb-10.2.16-linux-x86_64.tar.gz  -C /usr/local/
+        cd /usr/local/
+        ln -s mariadb-10.2.16-linux-x86_64/ mysql
+        chown -R mysql.mysql mysql/
+# Initialize the database and revise the configuration file
+        mkdir /app/lamp/mysql
+        chown -R mysql.mysql /app/lamp/mysql
+        cd /usr/local/mysql/
+        scripts/mysql_install_db  --datadir=/app/lamp/mysql --user=mysql
+        mkdir /etc/mysql/
+        cp support-files/my-huge.cnf  /etc/mysql/my.cnf
+        sed -i '/^\[mysqld]/adatadir=/app/lamp/mysql' /etc/mysql/my.cnf
+# Preparation for startup script 
+        cp support-files/mysql.server  /etc/init.d/mysqld
+        cd
+}
+
+# Create the function to compile and install PHP
+
+php () {
+# Install the packages required for compilation
+        yum install -y libxml2-devel bzip2-devel libmcrypt-devel
+# Unzip and start compiling and installing
+        cd /app
+        tar xf php-7.1.18.tar.bz2 &> /dev/null
+        cd php-7.1.18/
+        ./configure --prefix=/app/lamp/php --enable-mysqlnd --with-mysqli=mysqlnd --with-openssl --with-pdo-mysql=mysqlnd --enable-mbstring --with-freetype-dir --with-
+jpeg-dir --with-png-dir --with-zlib --with-libxml-dir=/usr --enable-xml --enable-sockets --enable-fpm --with-config-file-path=/etc --with-config-file-scan-dir=/etc/php
+.d --enable-maintainer-zts --disable-fileinfo
+        make && make install
+# Modify some necessary files
+        cp php.ini-production /etc/php.ini
+        cp sapi/fpm/init.d.php-fpm /etc/init.d/php-fpm
+        chmod +x /etc/init.d/php-fpm
+        cd /app/lamp/php/etc
+        cp php-fpm.conf.default php-fpm.conf
+        cp php-fpm.d/www.conf.default php-fpm.d/www.conf
+        cd
+}
+
+Main () {
+        echo -e '\033[1;31mStart installing httpd \033[0m'
+        httpd
+        echo -e '\033[1;31mHTTPD is finished  \033[0m'
+        echo -e '\033[1;31mStart installing MariaDB \033[0m'
+        mariadb
+        echo -e '\033[1;31mMariaDB is finished  \033[0m'
+        echo -e '\033[1;31mStart installing PHP \033[0m'
+        php
+        echo -e '\033[1;31mPHP is finished \033[0m'
+}
+Main
+
+# Add the binary to the path variable
+
+echo 'PATH=/app/lamp/php/bin:/app/lamp/httpd24/bin:/usr/local/mysql/bin:$PATH' > /etc/profile.d/lamp.sh
+source /etc/profile.d/lamp.sh
+
+# Start the service
+
+apachectl
+service mysqld start
+service php-fpm start
+
+echo -e '\033[1;31mAll services are running \033[0m'
+
+# Building a blog site
+
+echo -e '\033[1;31mStart building the blog site \033[0m'
+
+mysql -e "create database wpdb;grant all on wpdb.* to wpuser@'localhost' identified by 'centos'"
+cd /app
+tar xf wordpress-4.9.4-zh_CN.tar.gz
+cp -r wordpress/* /app/lamp/httpd24/htdocs/
+cd /app/lamp/httpd24/htdocs/
+mv wp-config-sample.php wp-config.php
+sed -i '/DB_NAME/s/database_name_here/wpdb/' wp-config.php
+sed -i '/DB_USER/s/username_here/wpuser/' wp-config.php
+sed -i '/DB_PASSWORD/s/password_here/centos/' wp-config.php
+
+echo -e '\033[1;31mBlog is set up  \033[0m'
+
+echo -e '\033[1;5;31mEND \033[0m'
+# END
