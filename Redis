@@ -1,0 +1,142 @@
+Redis
+官方网址：https://redis.io/
+Redis（Remote Dictionary Server）是一款开源的基于内存的数据结构存储服务，可以作为数据库DataBase、缓存Cache和消息队列Message Queue使用，并且是基于Key--Value存储的分布式系统
+Redis的是通过单进程处理N个请求，工作方式是C/S架构
+
+Redis的程序配置
+Redis的程序包在epel源中提供，程序包名即为redis
+主配置文件：/etc/redis.conf		服务名：redis.service		数据存储文件：/var/lib/redis
+服务启动后，默认是监听在本机的TCP协议：6379端口
+
+客户端工具命令：/usr/bin/redis-cli
+可直接进入交互式状态，通过键入“HELP @GROUP”（大小写不敏感，GROUP代表支持的数据结构）来查看相关数据库结构下的指令用法
+也可连接远程服务器：redis-cli -h REMOTE_HOST -a PASSWORD -p PORT
+
+当需要启动Redis服务时，主配置文件/etc/redis.conf常用的配置段和常用选项配置如下：
+1.NETWORK			（网络服务相关配置段）
+bind 0.0.0.0				指定监听本机的所有可用的地址，从而实现被远程连接
+protected-mode yes		启用保护模式（生效情况：没有启用bind以及没有使用requirepass认证，此时远程Client则不可以连接），以防redis被不明客户端连接进行误操作
+port 6379				默认监听端口，可修改
+
+2.GENERAL			（一般性配置段）
+daemonize no			默认是不作为守护进程运行（CentOS 7 中的systemd作为总线来管理这些服务，但是在CentOS 6中是依靠脚本运行，仍然需要开启）
+databases 16				设定redis服务器能够支持的数据库个数，默认16个（编号从0开始）
+
+3.SECURITY			（安全相关配置）
+requirepass PASSWORD	（默认关闭）需要开启，设定指定密码，从而客户端连接时需要输入此认证密码，客户端连接时可以直接加“-a PASSWORD”选项，或者是进入交互式状态后，输入“AUTH PASSWORD”进行认证
+
+4.LIMITS				（资源限制，因为redis是将数据放在内存中，若数据太多超过内存大小，则会使用交换分区，导致性能急剧下降）
+maxclients 10000				最大并发链接数，默认10000个
+maxmemory	VALUE			指定本地主机可使用的最大内存大小，单位是bytes，默认没有设定
+maxmemory-policy noeviction	当内存超出指定最大值时，采取的淘汰策略，默认是不淘汰（redis作为存储数据服务使用此策略）
+其中淘汰策略还有如下：
+volatile/allkeys-lru/random（基于lru算法或者random算法只淘汰设置了过期时间的Key/淘汰所有Key）、volatile-ttl（只淘汰最接近过期时间的Key）
+maxmemory-sample 5		随机找出满足设定的淘汰策略的Key进行比较，从而淘汰其中的某个，默认的比较个数为5
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Redis的持久化
+当Redis作为数据库使用时，需要数据的持久存储，Redis则有如下两种启用持久化的方法：
+1.RDB（也称为：SNAPSHOTTING快照）
+二进制文件格式存储，按事先定制的策略，周期性地将数据从内存同步至磁盘实现完全备份，快照文件默认：/var/lib/redis/dump.rdb
+客户端可使用SAVE或BGSAVE命令来手动启动快照保存机制:
+	SAVE：同步，即在主线程中保存快照，此时会阻塞所有客户端请求
+	BGSAVE：异步,backgroud后台操作
+需要的配置在主配置文件/etc/redis.conf中的 SNAPSHOTTING 段，配置如下：
+save 900 1
+save 300 10
+save 60 10000				
+以上为默认设置，表示：三个策略满足其中任意一个均会触发SNAPSHOTTING操作；900s内至少有一个key有变化，300s内至少有10个key有变化，60s内至少有1W个key发生变化（也可根据实际情况定义更多的策略）
+dbfilename	dump.rdb	默认的快照文件名
+dir /var/lib/redis			默认的存放路径（实际生产中则会单独的存放在另外的磁盘中，保证数据的安全）
+rdbchecksum yes			通过校验码检测数据是否发生错误
+rdbcompression yes		采用压缩，降低快照文件大小，提高I/O性能
+stop-writes-on-bgsave-error yes		当快照出现问题时，禁止新的写入操作请求
+
+2.AOF（Append Only File）
+将每次执行过的语句存放在文件中，利用fsync实现数据及时从内存同步到磁盘中，当redis服务器重启后，可通过重新调用文件执行存储的语句内容来实现重建数据库
+需要的配置在主配置文件/etc/redis.conf中的 APPEND ONLY MODE 段，配置如下：
+appendonly no	默认是不启用AOF
+appendfilename  "appendonly.aof"	默认的存放文件名，开启的情况下，路径在 /var/lib/redis 目录下
+appendfsync 		no：redis不执行主动同步操作，而是全凭内核进行同步
+				everysec：每秒一次同步（默认使用）
+				always：每语句每次立即同步
+auto-aof-rewrite-percentage	100	默认当变化量超过原有数据达到100%，则进行一次数据的重覆盖到磁盘存储文件中
+auto-aof-rewrite-min-size 64mb	默认当AOF的文件大小达到64M时，执行重写机制
+（注意以上两条选项同时满足时，才会生效，相当于重新创建新文件替换旧文件）
+客户端也可使用 BGREWRITEAOF 指令：实现AOF文件重写，不会读取正在使用AOF文件，而是通过将内存中的数据以命令的方式保存至临时文件中，完成之后替换原来的AOF文件； 
+
+需要注意的是，以上两种持久化一般情况下是不会同时开启的，若是两者都开启，则有以下两个特点：
+1.BGSAVE和BGREWRITEAOF不会同时进行
+2.Redis服务器启动时用持久化的数据文件恢复数据，会优先使用AOF
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Redis的主从复制（master/slave）
+主从复制是将“读”操作进行分散调度，对于“写”操作，仍然是master独立提供
+配置方法：
+方法一：配置文件中设置
+1.在slave节点上的配置文件/etc/redis.conf中的 REPLICATION 段中设置如下选项：
+slaveof MASTER_IP MASTER_PORT		指定主节点IP地址和监听端口
+masterauth MASTER_PASSWORD		若是主节点master需要认证，这里指定主节点认证密码
+slave-read-only yes					设定只读功能（必须）
+slave-priority 100						复制集群中，主节点故障时，sentinel应用场景中的主节点选举时使用的优先级；数字越小优先级越高，但0表示不参与选举；
+			
+2.slave节点还需将监听地址改为本机所有“bind 0.0.0.0”，从而可以对外通信
+（当从节点一直连接不上主节点时，则会自动关闭自己从节点的身份）
+方法二：在命令行中设置
+在slave节点上，进入redis-cli交互状态：
+SLAVEOF MASTER_IP MASTER_PORT
+CONFIG SET masterauth MASTER_PASSWORD
+CONFIG REWRITE
+注意在slave节点上也应该设置密码认证，并且最好与master密码认证一样，这样可以在后续master宕机后，某个slave升级为新master后，其余的slave仍然可以连接新master
+
+在客户端工具redis-cli交互式状态中，有运维经常需要使用的指令如下：
+INFO			可查看当前redis各种统计数据，和服务器端的工作状态
+KEYS *			查看已有的Key
+CLIENT LIST		查看已连接的客户端列表
+CONFIG SET		设置配置参数
+ GET	  查看配置参数
+ REWRITE 	将命令行设置的参数重写到配置文件中，从而实现永久生效
+ RESETSTAT 	重新置零以储存状态信息
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+sentinel作为内建功能，监控着Redis的主从复制集群，当master宕机后，可自动实现某个slave提升为新master
+但是为避免主观判断性，一般情况下需要奇数个独立的sentinel节点（实际生产中也可在主从节点上进行sentinel节点配置）监控master节点，当出现半数以上判断master宕机，则此时会开始选举某个slave作为新master，并且是基于slave设置的优先级来决定
+所有的sentinel节点上配置相同
+在配置文件 /etc/redis-sentinel.conf 设置如下：
+port	26379
+bind 0.0.0.0	（必须启用，否则会受保护，需要启用另外的连接redis-sentinel的密码）
+sentinel monitor NAME MASTER_IP MASTER_PORT <quorum>	自定集群名NAME和指定master的IP地址和端口
+<quorum>表示sentinel集群的quorum机制，即至少有quorum个sentinel节点同时判定主节点故障时，才认为其真的故障
+sentinel auth-pass NAME MASTER_PASSWORD		指定集群的master认证密码											
+sentinel down-after-milliseconds NAME TIME			监控到指定集群的master节点异常状态持续多久方才将标记为“故障”，TIME的单位默认为毫秒
+sentinel parallel-syncs NAME <numslaves>			指在提升新master过程中，能够被sentinel并行配置的从节点的数量
+sentinel failover-timeout NAME TIME					sentinel必须在此指定的时长内完成故障转移、提升新master操作，否则，将视为提升新master操作失败，默认单位为毫秒
+
+实际生产中，客户端访问Redis的主从复制集群时，还需要另外的语句路由器才能真正做到实现读写分离
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+数据分为源数据Key和数据Value，两者分开存放，通常意义上的分布就是指数据Value的分布，Key作为路由使用
+有中心节点（leader）专门存放Key，然后Value分散在各节点存放，客户端访问leader来获取Value
+无中心节点，每个节点只存放部分Value，但是每个节点都存放Key，通过内部协调协议同步，客户端可访问任何节点来获取任何Value
+
+Redis Cluster就是属于无中心节点的集群架构模式，cluster属于redis的内建属性，可直接使用
+（注意此时集群内节点间不应该启用主从复制）
+
+Redis Cluster是两级路由，便于扩缩容
+一级路由是通过将每个Key进行hash计算后对16384进行取模，取出的值得范围属于 0--16383（每个数字代表一个数据分片shard），从而进行对应分片存放
+二级路由是手工在集群中的节点上分配 0--16383 个数据分片
+
+Redis Cluster的配置过程：
+1.各节点相关配置在/etc/redis.conf中的 CLUSTER 段进行配置：
+cluster-enable yes					启用集群设置
+cluster-config-file 	FILE_NAME		集群节点集群信息配置文件,每个节点都有一个,由redis自动生成和更新,配置时避免名称冲突，存放的路径是在 /var/lib/redis 目录下，并且需要注意此文件要对redis用户有 r、w权限
+cluster-node-timeout TIME			集群节点互连超时的阈值，单位毫秒
+cluster-slave-validity-factor TIME	进行故障转移时,salve会申请成为master；有时slave会和master失联很久导致数据较旧，这样的slave不应该成为master，这个配置用来判断slave是否和master失联时间过长
+
+2.各节点上述配置设置好后启动redis，开始分配slots（分片编号）
+ redis-cli -c -h Node_IP -p 7000 cluster addslots {0..5000}	（不进入redis_cli交互状态进行分配）
+注意实际情况，在各节点上单独执行此命令，并且需要根据实际的节点数来均衡的分配slots（上述{0..5000}是样例）
+3.在其中一个节点上设定一下与其他节点的集群关系
+使用redis-cli进入交互状态，执行如下指令：
+CLUSTER MEET Node_IP Node_PORT	（不包括自身节点，其余节点的IP地址和监听端口号）
+上述配置结束，实现集群
