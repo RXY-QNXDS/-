@@ -1,0 +1,230 @@
+NGINX服务
+
+NGINX在OSI的应用层工作时，称为正向代理服务器（优势是利用缓存）
+NGINX在OSI的传输层工作时，称为调度器（反向代理服务器，类似于LVS）
+NGINX也可以充当web服务器
+
+--------------------------------------------------------------------------------
+
+I/O的工作机制基本介绍
+网络I/O：本质上是socket文件的读取
+磁盘I/O
+PIO（Program）：应用程序的输入输出模式，所有内容都需要经过CPU的转发
+DMA（Direct Memory Access）：直接内存访问，CPU只需要发出操作指令
+每次I/O，数据都是从Disk===è内核缓冲区，进行准备===è应用程序进程内存
+（硬件设施之间传输使用DMA实现，内存之间的数据转换CPU必须参与）
+
+--------------------------------------------------------------------------------
+
+I/O模型
+有两大特点
+1.消息通信机制的同步/异步
+    同步（synchronous）：调用者主动询问被调用者，来获取消息
+    异步（asynchronous）：被调用者主动将自己的状态消息回应调用者
+2.调用者在等待被调用者返回消息前的状态
+    阻塞（blocking）：调用者一直等待，直到被调用者返回I/O操作成功消息
+    非阻塞（nonblocking）：调用者可以不用一直等待
+根据以上两特点，分为五大类I/O模型：
+阻塞型、非阻塞型、复用型（通过select、poll、epoll实现）、信号驱动型、异步
+
+
+--------------------------------------------------------------------------------
+
+NGINX底层就是通过epoll来实现I/O复用模型
+NGINX是高度模块化的，通过调用不同类型的模块，实现不同的功能，模块主要分为如下：
+    1.核心模块
+2.标准模块（HTTP协议相关、Mail邮件相关、Stream代理模块）
+3.第三方模块
+官方的模块信息网站：http://nginx.org/en/docs/
+NGINX安装程序包nginx，服务名也为nginx
+默认存放网页路径：/usr/share/nginx/html/*.html
+NGINX服务的程序常用的选项如下：
+    nginx         	启动服务（systemctl start nginx）
+    nginx -t      	检测配置文件的语法
+    nginx -s stop    	关闭服务（systemctl stop nginx）
+    nginx -s reload   	重新加载NGINX服务
+NGINX服务的主配置文件：/etc/nginx/nginx.conf，主要结构分为四部分：
+1.main block：全局配置部分，以及event段
+    event {
+       事件驱动相关配置段
+       }
+2.http {
+    http/https协议相关配置段
+    server {
+       定义虚拟主机相关信息
+       location  URL {
+           指定URL特性
+              }
+       }
+    }
+3.还有mail、stream两个配置段，使用较少，在较新的版本中，默认是没有的
+其中http协议相关配置段，最为常用，并且为了便于设置http协议相关配置，可在目录/etc/nginx/conf.d/下建立自定义的以“*.conf”结尾的配置文件
+NGINX服务也有默认自带的内置变量，可以在配置文件中使用时直接调用：
+http://nginx.org/en/docs/varindex.html
+另外需要注意的是，配置文件中每个选项指令都有对应的配置段存放位置，必须遵守
+
+--------------------------------------------------------------------------------
+
+Main 全局配置段以及event段的常用配置
+1.pid  /run/nginx.pid
+nginx程序的进程编号对应路径，可自定义，服务启动才会存在
+2.worker_processes   auto
+auto是根据主机的CPU个数决定worker进程数，可自己设置数量，默认为1
+3.为了提高数据缓存的命中率，可将每个worker进程与主机CPU按顺序对应绑定
+    work_cpu_affinity 00000001 00000010 00000100 00001000
+    其中00000001-----0号CPU，以此类推
+4.worker_rlimit_nofile  NUMBER
+    接收限定用户请求能够打开的文件数
+5.worker_connections   NUMBER
+    存放在event段中，决定worker能够打开的最大并发连接数
+6.daemon on
+    以后台方式开启nginx服务，在测试环境时，可off 前台运行
+
+--------------------------------------------------------------------------------
+
+Http配置段相关的常用配置
+以下介绍的选项，在不同语句块之间部分选项是都可以使用的
+server {…}语句块
+1.listen
+PORT              	指定虚拟主机的监听端口
+IP[:PORT]          	指定IP地址以及[:对应PORT]
+
+unix:/PATH/TO/SOCKET_FILE 套接字文件（本机访问是可以使用）
+default_server     	设定默认的虚拟主机
+ssl			            通过加密的https访问
+
+2.server_name FQDN
+其中FQDN可以支持通配符以及正则表达式的写法，并且存在优先级机制，假设FQDN为www.ruixy.com，则优先级的顺序如下：
+精确FQDN > *.ruixy.com > www.ruixy.* > ~^.*\.ruixy\.com$ > default_server
+
+3.server_tokens on
+在响应报文的Server首部显示当前使用的nginx版本号，建议关闭 off
+
+4.root /PATH/     指明网页的根路径
+
+--------------------------------------------------------------------------------
+
+location uri{…}语句块
+此语句块是嵌套在server {…}语句块中使用的，可配置多个，用来实现uri路径到文件系统的路径映射（uri就是网页“/”站点下的路径）
+
+1.其中uri也支持一些匹配的写法，并且存在优先级机制，优先顺序如下：
+= uri > ^~ uri （匹配uri左边部分）> ~或~* uri （正则区分或不区分大小写）> uri
+
+2.alias /PATH /   将uri路径替换成新的磁盘路径/PATH/
+需要注意的是：假设uri=/test/，当uri最后是以“/”结束，则/PATH/也必须以“/”结尾才可以映射
+
+3.index FILE      指定默认站点文件名
+
+4.error_page CODE [=CODE] /uri
+可定义网页访问错误时，定义对应的状态码以及错误页面站点，也可将状态码进行转换
+
+5.try_files $uri…… [=CODE] （$uri是自带的变量）
+表示会按照顺序检查location uri{…}中uri对应的文件或者对应目录下的文件，如果找不到，则会将try_files中的最后一个一定存在的参数来作为回应页面，否则会出现状态码500的错误提示，也可指定回应的状态码信息
+
+6.limit_rate RATE 可指定客户端下载传输速率，RATE值是以 bytes/second 为单位
+
+7.allow/deny IP   指定允许/拒绝的IP进行访问，严格按照自上而下设定的顺序检查
+
+8.使用basic验证控制用户访问
+    auth_basic “验证提示信息”
+    auth_basic_user_file /PATH      虚拟用户、密码存放文件路径
+    其中/PATH 可使用 htpasswd 工具（httpd-tools提供）生成，命令如下：
+    htpasswd -c /PATH USER_NAME （首次需“-c”选项生成文件，后续不需要）
+
+9.stub_status     可展示某个uri访问的状态信息
+ 
+10.日志的使用
+    log_format NAME STRING   只能在http总配置段定义日志名和具体格式
+    access_log /PATH NAME    可在http所有配置段调用，并指定特定日志存放路径
+11.对数据的压缩
+    gzip on
+    gzip_comp_level LEVEL    	压缩级别，1-9，低到高
+    gzip_proxied any     	只在充当代理服务器时使用，对后端RS的响应报文，任何条件都压缩，也可指定特定条件
+    gzip_min_length LENGTH   	指定响应报文使用压缩的最小阀值
+gzip_types mime-type	    指明对那些类型资源压缩，mime-type有多种，可在/etc/nginx/mime-types 文件中查看
+
+12.实现用户请求的某个指定uri的跳转，基于ngx_http_rewrite_module模块，基本的使用格式示例如下：
+rewrite ^/old/(.*)$ /new/$1 last	表示将old文件夹转换为new文件夹，目录里的内容不变
+其中 last：重写完成后停止对当前URI在当前location中后续的其它重写操作，而后对新的URI启动新一轮重写检查；提前重启新一轮循环，不建议在location中使用
+除此之外还有另外三种标识：
+break：重写完成后停止对当前URI在当前location中后续的其它重写操作，而后直接跳转至重写规则配置块之后的其它配置；结束循环，建议在location中使用
+redirect：临时重定向，重写完成后以临时重定向方式直接返回重写后生成的新URI给客户端，由客户端重新发起请求；使用相对路径,或者http://或https://开头，状态码：302
+permanent:重写完成后以永久重定向方式直接返回重写后生成的新URI给客户端，由客户端重新发起请求，状态码：301
+
+具体使用方法：http://nginx.org/en/docs/http/ngx_http_rewrite_module.html#rewrite
+
+13.防止盗链
+    valid_referers    指定有效合理跳转的匹配网站
+    if {$invalid_referer} {
+       可指定无效非法跳转的回应信息
+    }
+示例如下：
+valid_referers none block server_names*.magedu.com *.mageedu.com magedu.* mageedu.* ~\.magedu\.;
+if ($invalid_referer) {
+return 403 http://www.baidu.com;
+}
+
+--------------------------------------------------------------------------------
+
+NGINX服务https的实现，基于ngx_http_ssl_module模块
+    Server {
+       listen 443 ssl；
+       server_name   FQDN；
+       root /PATH；
+       ssl_certificate FILE；（CA签名认证的证书文件路径）
+       ssl_certificate_key FILE；（申请证书的私钥文件路径）
+       ssl_session_cache shared:sslcache:20m；（worker之间共享缓存）
+       ssl_session_timeout TIME；（客户端连接使用缓存的有效时长）
+      }
+NGINX因为在编译时加入“TLS SNI support enabled”选项，所以可以支持一个物理服务器的一个IP上，建立多个虚拟主机实现https
+
+--------------------------------------------------------------------------------
+
+NGINX反向代理的实现（基于ngx_http_proxy_module）
+与LVS的区别在于：LVS是Client经过LVS自己去寻找RS拿数据；而NGINX反向代理时是帮Client去RS拿数据，然后在回发给Client，此时RS上的日志会显示访问者为NGINX反向代理的IP
+    location uri {
+proxy_pass URL[:PORT]  （URL表示RS的IP地址）
+        proxy_set_header NAME $remote_addr     （此选项表示Proxy发往RS的请求报文首部加入Client-IP，NAME自定义，RS只需在日志记录格式中加入NAME，则可以追踪到访问来源，若是Client到RS经过多重Proxy，则可以将$remote_addr 换为$proxy_add_x_forwarded_for，全部记录）
+}
+若是RS服务的PORT改变，则在URL也必须指定相同PORT
+需要注意的是，当 URL不以“/”结尾，则最终访问的地址是URL/uri，若是URL以“/”结尾，则最终访问地址就为URL。并且当uri使用正则表达式时，URL不能以“/”结尾，此时最终访问的地址是URL/uri
+
+--------------------------------------------------------------------------------
+
+NGINX反向代理配合FASTCGI服务的实现（基于ngx_http_fastcgi_module）
+    location ~* \.php$ {
+fastcgi_pass FASTCGI-IP:9000;
+fastcgi_index index.php;
+fastcgi_param SCRIPT_FILENAME /PATH$fastcgi_script_name;
+include fastcgi_params;
+}
+其中/PATH路径是FASTCGI服务器上php文件存放路径
+
+--------------------------------------------------------------------------------
+
+简单的NGINX的负载均衡调度实现（基于ngx_http_upstream_module模块），自带有健康性检查
+主http配置段中设置如下：
+    upstream NAME {
+server RS_IP[:PORT] OPTIONS
+……
+}
+在server{…}语句块下，实现代理映射
+    location uri {
+proxy_pass http://NAME
+}
+其中OPTIONS有如下一些常用的选项：
+weight = NUMBER   设置权重比例进行调度，默认为1
+backup     设置为备用服务器，在所有其他服务宕机后启用，一般使用本机充当，可自定义一个虚拟主机监听在指定端口上
+down       标记服务不可用，可实现服务器部分升级场景，但需要配合ip_hash使用
+ 
+另外在upstream{…}语句块中，还可以使用指定的调度算法：
+ip_hash           类似于LVS中的SH算法，通过hash运算第一次的调度情况后，绑定源IP和调度过的RS服务器，形成唯一性调度（此算法不支持backup）
+least_conn        类似于LVS的LC算法，根据RS的负载情况调度
+hash KEY [consistent]    基于指定的KEY来实现调度，KEY可以是变量、文本或两者结合，KEY举例如下：（此算法不支持backup）
+hash $request_uri  根据用户访问的uri来固定调度RS服务器
+hash $remote_addr  与ip_hash原理一样
+其中consistent是表示使用ketama一致性hash算法，通常是结合后端缓存服务器使用
+
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
