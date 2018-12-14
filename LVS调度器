@@ -1,0 +1,99 @@
+LVS调度器
+
+LVS（Linux Virtual Server）负载调度器
+应用于解决LB Cluster（集群的负载均衡）
+LVS充当的角色是虚拟服务器VS（Virtual Server）的角调度给真正色，负责调度，提供服务的服务器RS（Real Server）
+工作原理：VS根据接收到的请求报文的目标IP和目标协议及其端口，然后将其调度给某个RS
+
+--------------------------------------------------------------------------------
+
+LVS在网络防火墙链中的工作位置
+Client -----> PREROUTING -----> LVS -----> POSTROUTING -----> RS
+客户端若需要通过LVS访问RS
+1.首先需要经过LVS主机的PREROUTING链验证
+2.因为此时LVS中不存在Client要访问的服务，所以在进入INPUT链前隔断
+3.LVS根据设定好的调度算法进行转发调度，通过POSTROUTING链出去，发送给RS
+
+--------------------------------------------------------------------------------
+
+LVS一般是有两个IP地址
+VIP：VS用来连接外部客户端访问的IP地址
+DIP：VS用来连接RS的IP地址（一般为私网地址，为了安全，节省成本）
+LVS集群的类型分为四种：
+第一种：lvs-nat 
+本质是多目标IP的DNAT，通过将请求报文中的目标地址和目标端口修改为通过算法挑出的RS的RIP和PORT实现转发
+工作特点：
+1.请求报文与响应报文都需要经过lvs转发
+2.端口可映射，也就是可以进行修改
+3.VS因为是基于内核级的，所以必须是Linux系统
+
+第二种：lvs-dr（direct routing）（LVS默认使用的模式）
+本质上是通过为请求报文重新封装MAC进行转发，最终的源MAC是DIP位置的MAC地址，目标MAC是通过lvs计算调度挑选出的RS的RIP位置的MAC地址，在此过程中源以及目标的IP/PORT都不变
+工作特点：
+1.RS需要有和VS一样的VIP，RIP与DIP需要在同一个物理网段内
+2.为避免RS与VS上VIP的冲突，并且保证客户端发起的以VIP为目标的请求报文发送给VS，则需要如下操作：
+在RS上修改内核参数来限制ARP通告及应答级别
+echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore（不进行ARP通告）
+echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce（不向外通告本地IP）
+除了在“all”上需要进行配置，还应该在配置VIP的网卡上设置上述ARP相关信息
+3.因为是基于MAC地址，所以DIP与R IP地址必须在同一网段
+4.RIP的网关不能指向DIP，实现请求报文经过VS，响应报文不经过VS，由RS直接发往Client
+
+第三种：lvs-tun
+本质是在CIP不变的情况下，在请求报文外另外封装一个新的请求报文首部，也就是将（源CIP，目标VIP）封装成（源DIP，目标RIP），然后将此请求报文转发给RS，由RS直接响应Client
+工作特点：
+1.RS需要有和VS一样的VIP，RS网关一般不指向DIP
+2.请求报文经过VS，响应报文不经过VS
+3.不支持端口映射
+
+第四种：lvs-fullnat（此模式内核默认不支持）
+本质上是同时修改请求报文的源IP地址和目标IP地址，也就是将 "CIP -----> VIP" 转换为 "DIP -----> RIP"
+工作特点：
+1.请求报文与响应报文都需要经过lvs转发
+2.支持端口映射
+
+--------------------------------------------------------------------------------
+
+Lvs的调度算法（ipvs scheduler）
+静态方法：不考虑RS的状态，lvs主观调度
+1.RR：RoundRobin        		表示轮流调度
+2.WRR：Weighted RR         		表示权重下的RR，按照一定比列调度
+3.SH：Source Hashing    		表示将源IP与访问过的RS相互绑定，重复调度
+4.DH：Destination Hashing   	表示将发往同一目标地址的请求全发往首次调度给的RS
+动态算法：根据RS的负载状况进行合理分配调度，会在内存记录已经调度的RS情况，通过负载Overhead=值，来进行分配，越小越优先
+1.LC：least connection   		通过记录的RS已调度的连接数，来进行按少分配
+    	  Overhead=activeconns（已连接数）*256+inactiveconns（未连接数）
+2.WLC：Weighted LC           		带权重的LC，这是默认的调度算法
+   	   Overhead=（activeconns*256+inactiveconns）/weight
+3.SED：Shortest Expection Delay 初始连接时权重高者优先
+    	  Overhead=（activeconns+1）*256/weight
+4.NQ：Never Queue            		第一次连接调度时均匀分配，后续按照SED算法
+5.LBLC：Locality-Based LC   	动态算法的DH，根据负载状况选择需要调度给的RS
+6.LBLCR：LBLC with Replication  可以将负载重的RS复制到负载轻的RS上
+
+--------------------------------------------------------------------------------
+
+Lvs的命令工具，由ipvsadm程序包提供
+
+定义集群服务的命令格式如下：
+ipvsadm -A -t VIP:PORT 
+其中的含义如下：
+-A	表示增加一条集群规则，除此之外还有“-E 修改”、“-D 删除”
+-t	表示基于TCP协议的PORT，除此之外还有“-u UDP协议”、“-f 防火墙的数字标记”
+另外还可以增加选项 
+“-s SCHEDULER” 指定调度算法，默认算法为 WLC
+“-p [TIME]” 在指定的时间内可实现持久连接，若不指定时间大小，则默认是360秒
+ 定义指定集群服务中RS的命令格式如下：
+ipvsadm -a -t VIP:PORT -r RIP:PORT
+其中的含义如下：
+-a	表示增加一条集群中RS的规则，除此之外还有“- 修改”、“-d 删除”
+-t	表示基于TCP协议的PORT，除此之外还有“-u UDP协议”、“-f 数字标记”
+另外还可以另加选项
+“-g 指定DR模型，默认就是”、“-i 指定tun模型”、“-m 指定nat模型”、“-w WEIGHT 指定RS权重”
+需要注意的是在定义规则时，若RIP:PORT的PORT省略，则表示不做端口映射
+
+还有一些其他命令如下：
+ipvsadm  –C     	表示清空所有规则
+ipvsadm  –Ln    	表示以数字方式查看已经定义好的集群服务规则
+ipvsadm-save -n > /PATH	以数字方式将所有规则存放在指定文件路径中
+ipvsadm-restore < /PATH	加载文件中的lvs规则
