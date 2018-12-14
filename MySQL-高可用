@@ -1,0 +1,86 @@
+MySQL高可用
+因为主从复制是由Master服务器负责写操作，因而会存在单点失败的隐患，所以需要提高HA高可用性
+本文介绍了以下方法实现MySQL的高可用性
+--------------------------------------------------------------------------------
+
+一、MHA高可用（Master High Availability）
+
+原理：建立一个Manager管理者，它通过ssh协议与各集群（application）的主从节点进行通讯，在Master服务器出现故障时，可自动的将Master节点转移至其它Slave节点，提升某一Slave节点为新的Master节点使用，将其余的Slave节点指向新的Master节点。（MHA可自动发现Slave节点更新数据的新旧，优先提用数据较新的Slave节点，并会将其read_only变量设为不启用）
+
+MHA需要由两软件组成：mha4mysql-manager和mha4mysql-node工具包
+
+实现MHA的步骤：（注意：各节点间的时间务必保持一直）
+1.首先需要在Manager管理服务器上安装MHA需要的两工具包（先node后manager），各集群节点上只安装mha4mysql-node工具包；
+2.在Manager管理服务器的配置文件（需要手工建立，每个集群可单独设立）中为所有的集群进行global设置，以及为每个单独的集群设立特殊设置，设置如下：
+vim /etc/mastermha/app1.conf						（自定义配置文件路径及文件名）
+[server default]       （全局设置）
+user=USER_NAME 	（用来连接被管理集群的用户，由Master服务器创建）
+password=PASSWORD
+manager_workdir=/data/mastermha/app1/			（自定义manager管理服务器工作目录）	
+manager_log=/data/mastermha/app1/manager.log		（自定义manager管理服务器日志文件）		
+remote_workdir=/data/mastermha/app1/			（自定义远程主机工作目录）
+ssh_user=SSH用户
+repl_user=主从复制的用户
+repl_password=密码
+ping_interval=1
+   
+[server1]	（针对单独的MySQL集群设置，Master和Slave节点都写入）
+hostname=IP
+candidate_master=1
+[server2]
+hostname=IP
+candidate_master=1
+[server3]
+hostname=IP
+candidate_master=1
+   （注意：这里的candidate_master=1选项，表示Master服务器宕机后，Manager管理服务器会在配置文件中查询有此选项的Slave服务器来挑选当新Master）
+3.建立MySQL主从复制的集群，主从服务器都应在配置文件中加入选项“skip_name_resolve=1”，以防远程连接出现错误
+4.Master服务器中另外建立管理所有MySQL主从节点的账号信息：
+grant all on *.* to 'USER_NAME'@'IP' identified by 'PASSWORD';
+（IP是包括MySQL所有主从节点得地址段）
+5.Slave服务器在配置文件中还需要另外加入如下选项：
+read_only=on		（只读，为保证安全）
+relay_log_purge=0	（不清除中继日志）
+6.Manager管理服务器和MySQL主从复制集群节点之间互相建立ssh key验证
+ssh-keygen
+ssh-copy-id Manager_IP
+scp -r /root/.ssh Master_IP:
+scp -r /root/.ssh Slave_IP:
+7.为保证MHA的运行，可在上述步骤设置好后，对Manager管理服务器的创建的配置文件进行验证
+masterha_check_ssh --conf=/etc/mastermha/app1.conf		检查ssh协议是否正常使用
+masterha_check_repl --conf=/etc/mastermha/app1.conf		检查MySQL主从复制的相关配置
+8.启动监控（默认前台执行，建议手动设置为后台）
+masterha_manager --conf=配置文件
+
+--------------------------------------------------------------------------------
+延伸：
+因为调度器（proxy）是分离主从读写的，在MHA启用情况下，调度器还需要能够有重新指定ip的操作，keepalive则可以很好地完成此项功能
+--------------------------------------------------------------------------------
+
+二、Galera  Cluster高可用
+原理：多节点MySQL服务器可同时进行读和写，同步无延迟并发复制，基于WSREP协议（MySQL extended with the Write Set Replication），不依赖于二进制日志文件，是直接拷贝数据文件块来进行复制，并且在新增节点后，会自动同步数据
+（至少需要三个节点来实现，并且不能安装mysql软件包，而是需要另外安装其他的软件程序包）
+目前有两种版本可以实现：
+Percona Xtradb Cluster 及 MariaDB Cluster
+
+实现步骤：（这里针对MariaDB Cluster ）
+1.在MySQL集群各节点上都安装 MariaDB-Galera-server 软件包
+使用以下路径作为yum仓库源
+https://mirrors.tuna.tsinghua.edu.cn/mariadb/mariadb-5.5.61/yum/centos74-amd64/
+2.在配置文件/etc/my.cnf.d/server.cnf中必须设置的选项如下：
+wsrep_provider = /usr/lib64/galera/libgalera_smm.so   定义模块
+wsrep_cluster_address = "gcomm://IP1，IP2，……"	定义MySQL集群的成员ip
+binlog_format = row			二进制日志记录方式为行
+default_storage_engine = InnoDB	默认引擎为InooDB
+innodb_autoinc_lock_mode = 2		锁模式
+bind-address = 0.0.0.0			将端口绑定在所有IP
+还有可设置的一些选项：
+wsrep_cluster_name = 'NAME'		定义MySQL集群名称，默认my_wsrep_cluster
+wsrep_node_name = 'NODE1'		定义每个节点名称
+wsrep_node_address = 'NODE1_IP'	每个节点对应的IP
+3.首次启动服务时，第一个节点启东时需要使用以下选项：
+/etc/init.d/mysql start --wsrep-new-cluster	表示创建集群
+其余节点正常启动服务即可
+
+SHOW STATUS LIKE 'wsrep_cluster_size';	可查看集群节点数
+SHOW STATUS LIKE 'wsrep_%';		可查看集群状态
