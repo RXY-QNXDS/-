@@ -1,0 +1,165 @@
+MySQL备份还原
+因为一些客观因素，可能会导致数据的丢失，所以就需要对数据进行备份，还原，需要注意的是备份之后要进行还原测试，以防备份出现故障，而无法进行数据的还原
+备份类型可分为以下几种：
+部分备份：备份指定的表或数据
+完全备份：备份所有的数据
+增量备份：相对于最近一次备份发生变化的数据进行备份，还原时也必须要按照增量备份的顺序执行
+差异备份：相对于最近一次的完全备份发生变化的数据进行备份
+备份的方式分为以下三种：
+冷备	需停mysql数据库服务
+温备	类似给mysql数据库加读锁
+热备	读写仍可进行
+
+本文以下内容介绍了备份还原的一些方法
+--------------------------------------------------------------------------------
+
+一、LVM逻辑卷快照备份实验（先对数据库加锁，快照结束后立即解锁，近乎热备）
+
+第一步：建立逻辑卷，用来挂载数据库文件，以及二进制文件
+echo -e "n\n\n+1G\nt\n6\n8e\nw\n" | fdisk /dev/sda &> /dev/null
+pvcreate  /dev/sda6
+vgcreate vg0 /dev/sda6
+lvcreate  -n mysqldata -L 100M vg0
+lvcreate  -n binlogs -L 200M vg0
+mkfs.xfs  /dev/vg0/mysqldata
+mkfs.xfs  /dev/vg0/binlogs
+mkdir /data/{mysqldata,binlogs} -pv
+chown -R mysql.mysql /data/
+然后在/etc/fstab配置文件中，写入挂载信息，进行挂载
+第二步：将原有数据拷入指定数据目录中，重新指定数据库、二进制日志路径
+cp -av /var/lib/mysql/. /data/mysqldata/
+vim /etc/my.cnf
+[mysqld]
+log_bin=/data/binlogs/mysql-bin
+datadir=/data/mysqldata/
+systemctl start mariadb（启动服务）
+第三步：创建快照
+mysql -e "flush tables with read lock"（将所有表锁位只读）
+mysql -e 'SHOW MASTER STATUS'> /root/bin.log（记录二进制文件位置并导出到文件，以便于后期还原的使用）
+lvcreate -n mysqldatasnap -s -L 100M -p r  /dev/vg0/mysqldata
+（创建数据库文件只读型快照）
+mysql -e "unlock tables"（解锁）
+   若是需要达到几乎热备的情况，可以在命令行以“；”隔开，一行输入执行。
+第四步：在数据库中进行一些增删改操作。
+第五步：对数据库快照文件做备份，然后删除快照
+将数据库快照临时挂载，因为数据库逻辑卷和其快照UUID有冲突，所以挂载时需要加入选项：
+mount -o nouuid,norecovery /dev/vg0/mysqldatasnap /mnt/
+cp -a /mnt/ /backup/ （拷贝至指定文件夹）
+umount /mnt/
+lvremove /dev/vg0/mysqldatasnap （是为了不影响数据库工作时性能）
+上述步骤是完全的实现了数据的拷贝，接下来的步骤就是模拟的破坏实验
+第六步：停止服务，删除数据库，此时若是再次启动服务，仍能打开，是因为会自动生成初始化数据库，但是没有了之前操作的数据
+第七步：开始还原数据
+cp -a /backup/ /data/mysqldata/（将备份数据重新拷入到原目录中）
+此时可以启动服务，但是用户也会直接连接上去，而且此时数据还没恢复，所以修复过程中不应该让用户连接，可以在/etc/my.cnf配置文件中选项：
+skip-networking（在启动服务后可跳过网络自己连接）
+为了进一步能够还原做好快照后到破坏数据前这中间段用户进行操作发生的日志，可以在mysql中使用 “flush logs”生成一个新的初始化日志来进行隔离分辨
+第八步：根据mysql中“show master logs”查询的二进制日志情况，利用二进制日志还原至数据库最新状态
+cd /data/binlogs/
+mysqlbinlog --start-position=245 mysql-bin.000001 > /root/sqlbin.log
+    mysqlbinlog mysql-bin.000002 >> /root/sqlbin.log
+……
+   （表示将从需要的初始二进制文件开始，到破坏数据前最新的二进制文件都导入到指定文件中）
+mysql < /root/sqlbin.log （将此文件重新导回到数据库中执行）
+第九步：删除加入到配置文件/etc/my.cnf配置文件中选项：skip—networking，重新启动服务，则最终还原成功
+
+--------------------------------------------------------------------------------
+
+逻辑备份工具：mysqldump，客户端命令
+Options：
+-A		备份所有数据库，包括create database
+-B DB_NAME	备份指定表，可多个表一起，包括create database
+--master-data[=#]	会记录做备份时的二进制日志位置，便于后续还原操作
+#=1：所备份的数据之前加一条记录为"CHANGE MASTER TO"语句，非注释，不指定#，默认为1
+#=2：记录为注释的"CHANGE MASTER TO"语句
+-F	每备份一个数据库，会刷新一次日志
+--single-transaction	只适用于InnoDB，保证事务的一致性，只支持数据的增、删、改。
+对InooDB生产环境建议使用的策略：
+mysqldump -uroot -A -F -E -R --single-transaction --master-data=1 --flush-privileges --triggers --hex-blob > 指定文件
+对MyISAM生产环境建议使用的策略：
+mysqldump -uroot -A -F -E -R -x --master-data=1 --flush-privileges --triggers --hex-blob  > 指定文件
+（注意：实际生产中还会有选项“-p密码”）
+
+--------------------------------------------------------------------------------
+
+二、利用mysqldump工具对数据库的增量备份还原
+因为增量备份的还原需要涉及到二进制日志，因而需要开启二进制日志功能选项
+vim /etc/my.cnf
+[mysqld]
+log-bin 
+第一步：对已有数据库先做一次完全备份
+mysqldump -A -F --single-transaction --master-data=2 > /app/mysqldata
+第二步：进入到hellodb数据库中，对students表进行实验修改，如下：
+insert into students (name,age) values ('ruixiaoyu',18);
+insert into students (name,age) values ('hongxixiang',20);
+在以上操作后，又误删除了学生表：
+drop table students;
+第三步：在删除students表后，又对其他的表进行了操作，如下：
+select * from teachers;
+insert teachers values (5,'yaochen',50,'M');
+第四步：假设突然发现了这个重大失误，则此时需要立即在该数据库中执行读锁设置：
+flush tables with read lock;
+这是为了以防我们在进行还原操作中，还会有其他用户一直进行数据的修改
+第五步：需要根据以完全备份的/app/mysqldata，来查看到记录的二进制日志的记录位置，然后利用如下命令，对备份之后的新增二进制日志内容进行备份：
+mysqlbinlog --start-position=245 mariadb-bin.000002 > /app/binlogs
+第六步：在/app/binlogs文件中，查找出误操作的步骤，并将之移除，并且删除原数据库信息：
+rm -rf /var/lib/mysql/*
+第七步：为了在恢复过程中，不让用户在对数据库有操作影响
+vim /etc/my.cnf
+[mysqld]
+skip-networking
+第八步：启动服务，导入完全备份文件以及增量备份文件，进行还原：
+mysql < mysqldata
+mysql < binlogs
+第九步：删除/etc/my.cnf中选项： skip-networking，并重启服务
+
+--------------------------------------------------------------------------------
+Xtrabackuo 工具
+唯一开源且能够对InnoDB数据库进行热备，而且可以自动实现备份检验。
+此工具最基本的工作原理就是拷贝，通过将备份处理后的数据存入指定文件中，
+然后再将该指定文件中内容复制进已删除干净的原数据库存放目录中，修改权限后，实现还原。
+主要涉及的几个选项如下：
+1.—backup            表示要进行备份
+2.—target-dir        表示备份数据存放的目录
+3.--incremental
+表示创建一个增量备份，但是需要指定基于前一次完全备份或者增量备
+份的目录
+4.--incremental-basedir     表示的就是—incremental所指的目录
+5.--incremental-dir         表示还原时增量备份的目录
+6. —prepare    表示还原时进行预处理备份数据
+7. --apply-log-only     
+一般情况下,在备份完成后，数据尚且不能用于恢复操作，因为备份的数据中可能会包含尚未提交的事务或已经提交但尚未同步至数据文件中的事务。因此，此时数据文件仍处理不一致状态。此选项作用是通过回滚未提交的事务及同步已经提交的事务至数据文件使数据文件处于一致性状态 。此选项只需在最后一次增量备份还原使用。
+8. —redo-only
+   在最后一次增量备份前的增量备份还原时使用，确保事务的不回滚
+9. —copy-back或者—move-back
+   将备份数据拷贝或移动至源数据库目录中
+
+--------------------------------------------------------------------------------
+三、使用xtrabackup工具进行增量备份与还原
+假设实验有两次增量，为了便于观察，可单独建立不同文件夹来进行区分
+mkdir /app/{full,inc1,inc2}
+在原主机上，进行热备操作：
+第一步：先对数据库进行完全备份
+xtrabackup --backup --target-dir=/app/full
+第二步：假设进入数据库中进行第一次修改
+insert into students (name,age) values ('zhangqiling',0);
+并进行第一次增量备份
+xtrabackup --backup --target-dir=/app/inc1 --incremental-basedir=/app/full
+第三步：假设在数据库进行第二次修改
+insert teachers values (7,'wanjianyi',60,'M');
+并进行第二次增量备份
+xtrabackup --backup --target-dir=/app/inc2 --incremental-basedir=/app/inc1
+第四步：将此三个备份数据拷入到新主机中
+scp -r /app/* 172.18.122.241:/app/
+在新主机上实现还原
+第五步：确保新主机服务暂停，在新主机上进行备份数据的预处理
+xtrabackup --prepare --apply-log-only --target-dir=/app/full
+xtrabackup --prepare --apply-log-only --target-dir=/app/full --incremental-dir=/app/inc1
+xtrabackup --prepare --target-dir=/app/full --incremental-dir=/app/inc2
+（注意：除最后一次增量备份预处理外外，其余预处理都需要--apply-log-only选项）
+第六步：删除新主机下原目录下数据，并将处理后数据拷贝过去
+rm -rf /var/lib/mysql/*
+xtrabackup --copy-back --target-dir=/app/full
+第七步：需要修改拷贝后的数据文件属性
+chown -R mysql.mysql /var/lib/mysql/
+第八步：启动服务，即可使用
